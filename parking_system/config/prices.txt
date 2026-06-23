@@ -1,0 +1,10 @@
+# Parking prices file
+# Format: CITY_NAME,PRICE_PER_MINUTE
+# To remove a city on next reload prefix with '-': -CityName
+#
+TelAviv,0.50
+Jerusalem,0.35
+Haifa,0.30
+BeerSheva,0.20
+Eilat,0.40
+Netanya,0.25
