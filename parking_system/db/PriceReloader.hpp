@@ -1,25 +1,13 @@
 /**
  * @file PriceReloader.hpp
- * @brief Reloads the prices file into the SQLite DB and shared memory.
- *
- * Called by the DB main loop whenever the g_reloadPrices flag is set
- * (which happens inside the SIGUSR1 handler).
- *
- * Prices file format
- * ───────────────────
- *   CITY_NAME,PRICE_PER_MINUTE   → upsert
- *   -CITY_NAME                   → delete
- *   # comment                    → ignored
- *
- * The reload wraps all DB writes in a single transaction, then rebuilds
- * the shared memory prices array under a write-lock so the server
- * immediately picks up the new rates.
+ * @brief Reloads the prices file into SQLite DB and shared memory.
  */
 
 #pragma once
 
 #include <string>
 #include <fstream>
+#include <vector>       /* fix: was missing */
 #include <pthread.h>
 #include "Database.hpp"
 #include "../common/common.h"
@@ -38,7 +26,7 @@ public:
     {}
 
     /**
-     * @brief Read the prices file and apply changes to DB + shared memory.
+     * @brief Read the prices file and apply all changes to DB + shared memory.
      * @return Number of entries processed, or -1 on file error.
      */
     int reload()
@@ -51,17 +39,16 @@ public:
 
         Logger::info("Reloading prices from " + pricesFile_);
 
-        // Collect all changes first, then apply atomically
         struct Change {
             bool        remove;
             std::string city;
             double      price = 0.0;
         };
+
         std::vector<Change> changes;
 
         std::string line;
         while (std::getline(f, line)) {
-            // Strip CR
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty() || line[0] == '#') continue;
 
@@ -86,7 +73,7 @@ public:
             return 0;
         }
 
-        // Apply to DB in one transaction
+        /* Apply to DB in one transaction */
         db_.transaction([&] {
             for (auto &c : changes) {
                 if (c.remove) db_.deletePrice(c.city);
@@ -94,7 +81,7 @@ public:
             }
         });
 
-        // Rebuild shared memory prices array under write-lock
+        /* Rebuild shared memory prices array under write-lock */
         pthread_rwlock_wrlock(rwlock_);
         shm_->price_count = 0;
         for (auto &c : changes) {
@@ -108,9 +95,9 @@ public:
         }
         pthread_rwlock_unlock(rwlock_);
 
-        Logger::info("PriceReloader: applied " + std::to_string(changes.size())
-                     + " changes, SHM has "
-                     + std::to_string(shm_->price_count) + " active cities");
+        Logger::info("PriceReloader: applied " +
+                     std::to_string(changes.size()) + " changes, SHM has " +
+                     std::to_string(shm_->price_count) + " active cities");
 
         return static_cast<int>(changes.size());
     }

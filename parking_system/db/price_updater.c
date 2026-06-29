@@ -38,7 +38,7 @@ static void signal_db(const char *pid_file)
         return;
     }
     int pid = 0;
-    fscanf(fp, "%d", &pid);
+    if (fscanf(fp, "%d", &pid) != 1) pid = -1;
     fclose(fp);
 
     if (pid <= 0) {
@@ -72,7 +72,7 @@ static int cmd_add(const char *prices_file,
         char line[MAX_LINE];
         while (fgets(line, sizeof(line), fp)) {
             char copy[MAX_LINE];
-            strncpy(copy, line, MAX_LINE - 1);
+            snprintf(copy, MAX_LINE, "%s", line);
             copy[strcspn(copy, "\r\n")] = '\0';
             char *comma = strchr(copy, ',');
             if (comma) {
