@@ -1,3 +1,0 @@
-../Tools/Src/io_tools.c:8:5:__io_putchar	16	static
-../Tools/Src/io_tools.c:14:5:_write	24	static
-../Tools/Src/io_tools.c:22:5:_read	32	static
