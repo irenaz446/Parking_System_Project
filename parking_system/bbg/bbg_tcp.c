@@ -1,14 +1,22 @@
 /**
- * bbg_tcp.c  —  BBG Process 1
+ * bbg_tcp.c  —  BBG Process 1: Named PIPE → TCP Server
  *
- * Reads wire messages from the named PIPE (written by bbg_i2c.c),
- * and forwards them to the TCP server over Ethernet.
- * Reconnects to the server automatically if the connection drops.
+ * RESPONSIBILITY:
+ *   • Read wire messages from named PIPE (/tmp/parking.pipe)
+ *   • Forward complete lines to TCP server on PC
+ *   • Handle TCP reconnection on connection loss
+ *   • Buffer incomplete lines until newline arrives
  *
- * Compile:  gcc bbg_tcp.c -o bbg_tcp
- * Run:      ./bbg_tcp <SERVER_IP> <SERVER_PORT>
+ * SYNCHRONIZATION with Process 2:
+ *   • Waits for Process 2 to create FIFO
+ *   • Opens read end to unblock Process 2 (which waits on write end)
  *
- * Start AFTER bbg_i2c is already waiting (so the FIFO exists).
+ * BUILD & RUN:
+ *   gcc bbg_tcp.c -o bbg_tcp
+ *   ./bbg_tcp <SERVER_IP> <SERVER_PORT>
+ *   Example: ./bbg_tcp 192.168.10.1 8080
+ *
+ * IMPORTANT: Start this AFTER bbg_i2c (it opens the FIFO read end)
  */
 
 #include <stdio.h>
@@ -23,26 +31,34 @@
 #include <arpa/inet.h>
 
 /* ── Configuration ───────────────────────────────── */
-#define PIPE_PATH          "/tmp/parking.pipe"
-#define RECONNECT_DELAY_S  5
-#define BUF_SIZE           256
+#define PIPE_PATH          "/tmp/parking.pipe"  /* read from Process 2 */
+#define RECONNECT_DELAY_S  5                    /* TCP retry delay */
+#define BUF_SIZE           256                   /* max message buffer */
 
-/* ── Globals ─────────────────────────────────────── */
-static volatile int g_running = 1;
-static int          g_pipe_fd = -1;
-static int          g_tcp_fd  = -1;
+/* ── Global Variables ─────────────────────────────── */
+static volatile int g_running = 1;  /* set to 0 by signal handler */
+static int          g_pipe_fd = -1; /* file descriptor for PIPE read end */
+static int          g_tcp_fd  = -1; /* file descriptor for TCP socket */
 
-/* ── Signal handler ──────────────────────────────── */
+/* ── Signal Handler ──────────────────────────────– */
+/**
+ * Gracefully shutdown on SIGINT (Ctrl+C) or SIGTERM
+ */
 static void handle_signal(int s)
 {
-    (void)s;
-    g_running = 0;
+    (void)s;  /* unused parameter */
+    g_running = 0;  /* break out of main loop */
 }
 
-/* ── Open PIPE read end ──────────────────────────── */
+/* ── Open PIPE Read End ──────────────────────────– */
+/**
+ * Open named PIPE for reading
+ * Opening the read end unblocks Process 2 which waits on write end
+ * Returns: file descriptor on success, -1 on error
+ */
 static int pipe_open(void)
 {
-    /* Opening the read end unblocks Process 2 which is waiting on write end */
+    /* Open read end of FIFO (non-blocking would require more logic) */
     int fd = open(PIPE_PATH, O_RDONLY);
     if (fd < 0) {
         printf("[ERR] Cannot open pipe %s: %s\n",
@@ -54,25 +70,34 @@ static int pipe_open(void)
     return fd;
 }
 
-/* ── Connect to TCP server ───────────────────────── */
+/* ── Connect to TCP Server ──────────────────────– */
+/**
+ * Establish TCP connection to server
+ * Returns: socket fd on success, -1 on error
+ */
 static int tcp_connect(const char *ip, int port)
 {
+    /* Create TCP socket */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         printf("[ERR] socket(): %s\n", strerror(errno));
         return -1;
     }
 
+    /* Setup server address structure */
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port   = htons((uint16_t)port);
 
+    /* Parse IP address string */
     if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
         printf("[ERR] Invalid server IP: %s\n", ip);
         close(fd);
         return -1;
     }
+
+    /* Attempt connection */
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         printf("[ERR] connect(%s:%d): %s\n", ip, port, strerror(errno));
         close(fd);
@@ -83,7 +108,13 @@ static int tcp_connect(const char *ip, int port)
     return fd;
 }
 
-/* ── Send message, reconnect on failure ──────────── */
+/* ── Send Message to Server ──────────────────────– */
+/**
+ * Send wire message to TCP server
+ * Reconnects automatically if connection is lost
+ * Reads server reply non-blocking and logs it
+ * Returns: 0 on success, -1 on failure
+ */
 static int tcp_send(const char *ip, int port,
                     const char *msg, size_t len)
 {
@@ -93,6 +124,7 @@ static int tcp_send(const char *ip, int port,
         if (g_tcp_fd < 0) return -1;
     }
 
+    /* Send message (MSG_NOSIGNAL prevents crash on broken pipe) */
     if (send(g_tcp_fd, msg, len, MSG_NOSIGNAL) < 0) {
         printf("[ERR] TCP send: %s — reconnecting\n", strerror(errno));
         close(g_tcp_fd);
@@ -100,11 +132,12 @@ static int tcp_send(const char *ip, int port,
         return -1;
     }
 
-    /* Read server reply non-blocking */
+    /* Try to read server reply (non-blocking) */
     char reply[128];
     ssize_t n = recv(g_tcp_fd, reply, sizeof(reply) - 1, MSG_DONTWAIT);
     if (n > 0) {
         reply[n] = '\0';
+        /* Strip newline/carriage return from reply */
         reply[strcspn(reply, "\r\n")] = '\0';
         printf("[TCP] Server reply: %s\n", reply);
     }
@@ -112,9 +145,10 @@ static int tcp_send(const char *ip, int port,
     return 0;
 }
 
-/* ── Main ────────────────────────────────────────── */
+/* ── Main Loop ──────────────────────────────────– */
 int main(int argc, char *argv[])
 {
+    /* Validate command-line arguments */
     if (argc < 3) {
         printf("Usage: %s <SERVER_IP> <SERVER_PORT>\n", argv[0]);
         printf("  e.g. %s 192.168.1.100 8080\n", argv[0]);
@@ -124,11 +158,12 @@ int main(int argc, char *argv[])
     const char *server_ip   = argv[1];
     int         server_port = atoi(argv[2]);
 
+    /* Register signal handlers for graceful shutdown */
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
-    signal(SIGPIPE, SIG_IGN);  /* don't crash on broken TCP connection */
+    signal(SIGPIPE, SIG_IGN);  /* prevent crash when TCP peer closes */
 
-    /* Open pipe read end — this unblocks Process 2 */
+    /* Open PIPE read end — this unblocks Process 2 */
     g_pipe_fd = pipe_open();
     if (g_pipe_fd < 0) return 1;
 
@@ -139,19 +174,20 @@ int main(int argc, char *argv[])
     char   buf[BUF_SIZE];
     size_t buf_len = 0;
 
+    /* Main event loop */
     while (g_running) {
 
-        /* ── 1. Read from PIPE ──────────────────────── */
+        /* ── Step 1: Read from PIPE ──────────────────────────── */
         ssize_t n = read(g_pipe_fd,
-                         buf + buf_len,
-                         sizeof(buf) - buf_len - 1);
+                         buf + buf_len,              /* append to end */
+                         sizeof(buf) - buf_len - 1); /* space left */
         if (n < 0) {
             if (errno == EINTR) continue;   /* interrupted by signal */
             printf("[ERR] Pipe read: %s\n", strerror(errno));
             break;
         }
         if (n == 0) {
-            /* Process 2 closed the pipe — wait for it to restart */
+            /* Process 2 closed the pipe — wait for restart */
             printf("[WARN] Pipe closed by Process 2 — waiting...\n");
             close(g_pipe_fd);
             sleep(2);
@@ -164,12 +200,13 @@ int main(int argc, char *argv[])
         buf_len += (size_t)n;
         buf[buf_len] = '\0';
 
-        /* ── 2. Extract complete lines (ending with \n) */
+        /* ── Step 2: Extract complete lines (ending with \n) ──────── */
         char *line  = buf;
         char *newline;
 
+        /* Process all complete lines in buffer */
         while ((newline = strchr(line, '\n')) != NULL) {
-            /* Null-terminate this line */
+            /* Temporarily null-terminate this line */
             *newline = '\0';
             size_t line_len = (size_t)(newline - line);
 
@@ -178,7 +215,7 @@ int main(int argc, char *argv[])
             /* Restore newline for TCP message */
             *newline = '\n';
 
-            /* ── 3. Forward complete line to TCP server */
+            /* ── Step 3: Forward complete line to TCP server ──────── */
             if (tcp_send(server_ip, server_port,
                          line, line_len + 1) < 0) {
                 printf("[WARN] TCP failed — retry in %ds\n",
@@ -189,12 +226,13 @@ int main(int argc, char *argv[])
             line = newline + 1;
         }
 
-        /* Move any incomplete line to front of buffer */
+        /* Move any incomplete line to front of buffer for next read */
         buf_len = strlen(line);
         if (buf_len > 0 && line != buf)
             memmove(buf, line, buf_len);
     }
 
+    /* Cleanup */
     if (g_pipe_fd >= 0) close(g_pipe_fd);
     if (g_tcp_fd  >= 0) close(g_tcp_fd);
     printf("\n[INFO] Process 1 stopped\n");
